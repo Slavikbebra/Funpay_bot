@@ -1,0 +1,34 @@
+from aiogram.filters.callback_data import CallbackData
+from uuid import UUID
+
+
+class ModulePage(CallbackData, prefix="modpage"):
+    uuid: UUID
+
+class MessagePage(CallbackData, prefix="msgpage"):
+    message_id: str
+
+class AutoDeliveryPage(CallbackData, prefix="audepage"):
+    lot_id: int
+
+class CustomCommandPage(CallbackData, prefix="cucopage"):
+    command: str
+
+
+class ChatPage(CallbackData, prefix="chtpage"):
+    id: str
+
+
+class OrderPage(CallbackData, prefix="ordpage"):
+    id: str
+
+
+class LotPage(CallbackData, prefix="lotpage"):
+    id: str
+
+
+class ReviewPage(CallbackData, prefix="revpage"):
+    id: str
+
+class ReleasePage(CallbackData, prefix="relpage"):
+    index: int

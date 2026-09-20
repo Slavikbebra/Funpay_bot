@@ -1,0 +1,56 @@
+diff --git a/tgbot/handlers/states_actions.py b/tgbot/handlers/states_actions.py
+index be9f7e5..9ade30a 100644
+--- a/tgbot/handlers/states_actions.py
++++ b/tgbot/handlers/states_actions.py
+@@ -2,7 +2,6 @@ from aiogram import types, Router, F
+ from aiogram.fsm.context import FSMContext
+ from tempfile import NamedTemporaryFile
+ import os
+-import asyncio
+ 
+ from .. import templates as templ
+ from .. import states
+@@ -39,14 +38,16 @@ async def _send_mess(message: types.Message, state: FSMContext):
+             await message.bot.download(photo, destination=tmp.name)
+             tmp_path = tmp.name
+ 
+-        if message.caption:
+-            fpbot.send_message(chat.id, message.caption.strip())
+-            sent_msg += f"{message.caption.strip()}, "
+-            await asyncio.sleep(0.5)
+-
+-        acc.send_image(chat.id, tmp_path)
+-        os.remove(tmp_path)
+-        sent_msg += f"<b>Изображение</b>"
++        try:
++            # FunPay does not support a text caption attached to a chat image.
++            # Telegram captions are intentionally ignored here.
++            acc.send_image(chat.id, tmp_path)
++            sent_msg = "<b>Изображение</b>"
++        finally:
++            try:
++                os.remove(tmp_path)
++            except OSError:
++                pass
+ 
+     return acc, chat, sent_msg
+ 
+diff --git a/tgbot/handlers/states_funpay.py b/tgbot/handlers/states_funpay.py
+index 7a604f9..3ccfb89 100644
+--- a/tgbot/handlers/states_funpay.py
++++ b/tgbot/handlers/states_funpay.py
+@@ -41,11 +41,9 @@ async def _send_mess(message: types.Message, state: FSMContext):
+                 await message.bot.download(photo, destination=tmp.name)
+                 photo_paths.append(tmp.name)
+ 
+-        if message.caption:
+-            text = message.caption.strip()
+-            sent_msg += message.caption.strip()
+-
+-        sent_msg += f", <b>Изображения ({len(photo_paths)})</b>" if text else f"<b>Изображения ({len(photo_paths)})</b>"
++        # FunPay does not support a text caption attached to a chat image.
++        # Telegram captions are intentionally ignored; only the image(s) are sent.
++        sent_msg += f"<b>Изображения ({len(photo_paths)})</b>"
+ 
+     if text:
+         acc.send_message(chat_id, text)

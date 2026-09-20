@@ -1,0 +1,60 @@
+from aiogram.fsm.state import State, StatesGroup
+
+
+class PageStates(StatesGroup):
+    waiting_for_page = State()
+
+
+class SystemStates(StatesGroup):
+    waiting_for_password = State()
+    waiting_for_current_password = State()
+    waiting_for_new_password = State()
+
+
+class ActionsStates(StatesGroup):
+    waiting_for_fast_answer_message = State()
+    waiting_for_chat_answer_message = State()
+
+    waiting_for_fast_review_answer = State()
+
+
+class SettingsStates(StatesGroup):
+    waiting_for_golden_key = State()
+    waiting_for_user_agent = State()
+
+    waiting_for_requests_timeout = State()
+    waiting_for_runner_requests_delay = State()
+    waiting_for_fp_proxy = State()
+    waiting_for_tg_proxy = State()
+    waiting_for_tg_custom_api_url = State()
+
+    waiting_for_auto_tickets_orders_per_ticket = State()
+    waiting_for_auto_tickets_min_order_age = State()
+    waiting_for_auto_tickets_create_interval = State()
+
+    waiting_for_notifications_chat_id = State()
+    waiting_for_watermark_value = State()
+
+    waiting_for_new_fast_reply_text = State()
+    waiting_for_fast_reply_text = State()
+
+    waiting_for_logs_max_file_size = State()
+    waiting_for_module_file = State()
+    waiting_for_config_file = State()
+
+
+class MessagesStates(StatesGroup):
+    waiting_for_message_text = State()
+
+
+class CustomCommandsStates(StatesGroup):
+    waiting_for_new_custom_command = State()
+    waiting_for_new_custom_command_answer = State()
+    waiting_for_custom_command_answer = State()
+
+
+class AutoDeliveriesStates(StatesGroup):
+    waiting_for_new_auto_delivery_lot_link = State()
+    waiting_for_new_auto_delivery_message = State()
+    waiting_for_auto_delivery_lot_link = State()
+    waiting_for_auto_delivery_message = State()
