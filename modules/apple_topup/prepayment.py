@@ -152,6 +152,127 @@ INVALID_NUMBER = "❌ Напишите номер тарифа от 1 до 8 и�
 _lock = asyncio.Lock()
 _worker_task: asyncio.Task | None = None
 
+# Защита от автоматической выдачи меню конкурентам:
+# проверяем профиль FunPay отправителя и ищем активные SoundCloud-лоты.
+# Проверка выполняется в отдельной задаче и сетевой запрос запускается
+# через to_thread(), поэтому медленный запрос профиля не блокирует
+# обработку сообщений других покупателей.
+SOUNDCLOUD_PROFILE_CACHE_SECONDS = 10 * 60
+SOUNDCLOUD_MARKERS = (
+    "soundcloud",
+    "sound cloud",
+    "soundcloud go",
+    "soundcloud go+",
+    "soundcloud go plus",
+)
+_profile_cache: dict[int, tuple[float, bool, str | None]] = {}
+_profile_user_locks: dict[str, asyncio.Lock] = {}
+_profile_cache_lock = asyncio.Lock()
+
+# Если покупатель уже имеет любой заказ в магазине, обычные сообщения
+# в этом чате не должны запускать приветственное меню предоплаты.
+# Команды !ПРАЙС / !ИНСТРУКЦИЯ / !МЕНЮ при этом остаются доступными.
+EXISTING_SALE_CACHE_SECONDS = 10 * 60
+_existing_sale_cache: dict[str, tuple[float, bool]] = {}
+_existing_sale_cache_lock = asyncio.Lock()
+
+
+
+
+def _profile_has_soundcloud_lot_sync(bot, author_id: int) -> tuple[bool, str | None]:
+    """Синхронно проверяет публичные активные лоты профиля FunPay."""
+    profile = bot.account.get_user(int(author_id))
+    for lot in profile.get_lots():
+        title = str(getattr(lot, "title", None) or getattr(lot, "description", None) or "")
+        haystack = title.casefold().replace("ё", "е")
+        if any(marker in haystack for marker in SOUNDCLOUD_MARKERS):
+            return True, title
+    return False, None
+
+
+def _has_existing_sale_sync(bot, username: str) -> bool:
+    """Проверяет, есть ли у покупателя уже заказ в продажах FunPay."""
+    result = bot.account.get_sales()
+    sales = result[1] if isinstance(result, tuple) else result
+    username_cf = str(username).casefold()
+    for order in sales or []:
+        buyer = str(getattr(order, "buyer_username", "") or "").casefold()
+        if buyer == username_cf:
+            return True
+    return False
+
+
+async def _has_existing_sale(bot, username: str) -> bool:
+    """Кешированно проверяет наличие любого предыдущего заказа."""
+    key = str(username).casefold()
+    now = time.time()
+    async with _existing_sale_cache_lock:
+        cached = _existing_sale_cache.get(key)
+        if cached and now - cached[0] < EXISTING_SALE_CACHE_SECONDS:
+            return cached[1]
+
+    try:
+        found = await asyncio.to_thread(_has_existing_sale_sync, bot, username)
+    except Exception:
+        logger.exception(
+            "PREPAYMENT: не удалось проверить существующие заказы покупателя %s",
+            username,
+        )
+        # При ошибке проверки не блокируем команды/обычную логику.
+        return False
+
+    async with _existing_sale_cache_lock:
+        _existing_sale_cache[key] = (time.time(), found)
+    return found
+
+
+async def _is_soundcloud_seller(bot, username: str, author_id) -> bool:
+    """Возвращает True, если в профиле пользователя найден SoundCloud-лот."""
+    try:
+        author_id = int(author_id)
+    except (TypeError, ValueError):
+        # Без ID профиля проверить лоты надёжно нельзя. В этом случае
+        # не блокируем обычного покупателя.
+        logger.warning(
+            "🛡 PREPAYMENT: не удалось получить author_id для %s; проверка профиля пропущена",
+            username,
+        )
+        return False
+
+    now = time.time()
+    async with _profile_cache_lock:
+        cached = _profile_cache.get(author_id)
+        if cached and now - cached[0] < SOUNDCLOUD_PROFILE_CACHE_SECONDS:
+            return cached[1]
+
+    try:
+        found, lot_title = await asyncio.to_thread(
+            _profile_has_soundcloud_lot_sync, bot, author_id
+        )
+    except Exception:
+        # Ошибка проверки профиля не должна задерживать/ломать сообщения
+        # остальных покупателей.
+        logger.exception(
+            "🛡 PREPAYMENT: ошибка проверки профиля FunPay %s (%s)",
+            username, author_id,
+        )
+        return False
+
+    async with _profile_cache_lock:
+        _profile_cache[author_id] = (time.time(), found, lot_title)
+
+    if found:
+        logger.info(
+            "🛡 PREPAYMENT: %s заблокирован — обнаружен SoundCloud-лот в профиле: %r",
+            username, lot_title,
+        )
+    else:
+        logger.info(
+            "🛡 PREPAYMENT: профиль %s проверен — SoundCloud-лоты не найдены",
+            username,
+        )
+    return found
+
 
 def _load() -> dict:
     DATA_FILE.parent.mkdir(exist_ok=True)
@@ -631,20 +752,27 @@ async def _select_product(bot, username: str, chat_id, number: str) -> None:
             _send_prepaid_message(bot, chat_id, "❌ Не удалось подготовить лот. Пожалуйста, попробуйте ещё раз позже.")
 
 
-async def handle_message(bot, event) -> bool:
-    """Обрабатывает только предоплатный сценарий. True = сообщение поглощено."""
-    _ensure_worker(bot)
+async def _handle_message_checked(bot, event) -> None:
+    """Выполняет предоплатную обработку после проверки профиля."""
     message = getattr(event, "message", None)
     if not message or not getattr(message, "author", None):
-        return False
+        return
+
     username = message.author
+    author_id = getattr(message, "author_id", None)
+
+    # Проверяем профиль ДО любого автоматического сообщения.
+    # Если найден SoundCloud-лот, задача завершается молча.
+    if await _is_soundcloud_seller(bot, username, author_id):
+        return
+
     text = (message.text or "").strip()
     lower = text.lower()
     logger.info("PREPAYMENT DEBUG: получено сообщение от %s: %r", username, text)
 
     # После оплаты управление остаётся за существующим Apple TopUp flow.
     if storage.find_active_order(username):
-        return False
+        return
 
     # Сначала добиваем просроченную заявку этого пользователя, если worker не успел
     # обработать её до нового сообщения. Это не отменяет проверку оплаты на границе таймера.
@@ -661,6 +789,13 @@ async def handle_message(bot, event) -> bool:
     data = _load()
     user = _user(data, username)
     state = user.get("state") if user else None
+
+    # ВАЖНО: обычное сообщение покупателя, у которого уже есть/был
+    # любой FunPay-заказ, не должно запускать приветственное меню.
+    # Иначе покупатель другой категории после оплаты пишет продавцу,
+    # а предоплата ошибочно отвечает своим стартовым сообщением.
+    # Явные команды ниже по-прежнему обрабатываются.
+    has_previous_sale = await _has_existing_sale(bot, username) if user is None else False
 
     # Активную/очередную заявку не сбрасываем командами навигации:
     # иначе можно оставить слот занятым без покупателя.
@@ -695,6 +830,72 @@ async def handle_message(bot, event) -> bool:
         _send_prepaid_message(bot, message.chat_id, INVALID_NUMBER)
         return True
 
-    # Новый покупатель или обычное первое сообщение.
+    # Если пользователь уже имеет запись предоплаты, стартовое сообщение
+    # повторно никогда не отправляем на обычные вопросы/сообщения.
+    if user is not None:
+        logger.debug(
+            "PREPAYMENT: обычное сообщение от %s без команды — стартовое меню не повторяем (state=%s)",
+            username, state,
+        )
+        return True
+
+    # Для покупателя с уже существующим заказом в другой категории также
+    # ничего автоматически не отправляем. Это предотвращает вмешательство
+    # предоплатного сценария в чужой заказ.
+    if has_previous_sale:
+        logger.info(
+            "PREPAYMENT: %s уже имеет заказ FunPay — стартовое меню не отправляем",
+            username,
+        )
+        return True
+
+    # Только действительно новый покупатель получает стартовое сообщение.
     await _show_menu(bot, username, message.chat_id)
+
+
+async def handle_message(bot, event) -> bool:
+    """Поглощает NEW_MESSAGE и запускает предоплату без блокировки Runner."""
+    _ensure_worker(bot)
+    message = getattr(event, "message", None)
+    if not message or not getattr(message, "author", None):
+        return False
+
+    username = str(message.author)
+
+    # Уже оплаченный/активный Apple TopUp должен идти по старому сценарию.
+    if storage.find_active_order(username):
+        return False
+
+    # Не await-им сетевую проверку профиля здесь. Runner FunPay вызывает
+    # NEW_MESSAGE последовательно, поэтому ожидание get_user() здесь могло бы
+    # задержать обработку сообщений всех остальных покупателей.
+    # Каждому покупателю даём собственную очередь задач: сообщения одного
+    # покупателя сохраняют порядок, а разные покупатели обрабатываются параллельно.
+    key = username.casefold()
+    user_lock = _profile_user_locks.get(key)
+    if user_lock is None:
+        user_lock = asyncio.Lock()
+        _profile_user_locks[key] = user_lock
+
+    async def _run_serialized() -> None:
+        async with user_lock:
+            await _handle_message_checked(bot, event)
+
+    task = asyncio.create_task(_run_serialized())
+
+    def _cleanup(done_task: asyncio.Task, user_key: str = key) -> None:
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception(
+                "PREPAYMENT: ошибка фоновой обработки сообщения от %s",
+                username,
+            )
+        # Не удаляем lock, если за время выполнения уже появилась новая задача
+        # для того же пользователя. Оставляем лёгкий lock-кэш — пользователей
+        # обычно немного, а это исключает гонки между их командами.
+
+    task.add_done_callback(_cleanup)
     return True
